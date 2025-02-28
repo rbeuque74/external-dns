@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -41,6 +43,7 @@ const (
 	ovhDefaultTTL = 0
 	ovhCreate     = iota
 	ovhDelete
+	ovhUpdate
 )
 
 var (
@@ -76,9 +79,10 @@ type OVHProvider struct {
 }
 
 type ovhClient interface {
-	Post(string, interface{}, interface{}) error
-	Get(string, interface{}) error
-	Delete(string, interface{}) error
+	PostWithContext(context.Context, string, any, any) error
+	PutWithContext(context.Context, string, any, any) error
+	GetWithContext(context.Context, string, any) error
+	DeleteWithContext(context.Context, string, any) error
 }
 
 type dnsClient interface {
@@ -86,7 +90,11 @@ type dnsClient interface {
 }
 
 type ovhRecordFields struct {
+	ovhRecordFieldUpdate
 	FieldType string `json:"fieldType"`
+}
+
+type ovhRecordFieldUpdate struct {
 	SubDomain string `json:"subDomain"`
 	TTL       int64  `json:"ttl"`
 	Target    string `json:"target"`
@@ -140,41 +148,88 @@ func (p *OVHProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, error)
 	return endpoints, nil
 }
 
+func planChangesByZoneName(zones []string, changes *plan.Changes) map[string]*plan.Changes {
+	zoneNameIDMapper := provider.ZoneIDName{}
+	for _, zone := range zones {
+		zoneNameIDMapper.Add(zone, zone)
+	}
+
+	output := map[string]*plan.Changes{}
+	for _, endpt := range changes.Delete {
+		_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
+		if _, ok := output[zoneName]; !ok {
+			output[zoneName] = &plan.Changes{}
+		}
+		output[zoneName].Delete = append(output[zoneName].Delete, endpt)
+	}
+	for _, endpt := range changes.Create {
+		_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
+		if _, ok := output[zoneName]; !ok {
+			output[zoneName] = &plan.Changes{}
+		}
+		output[zoneName].Create = append(output[zoneName].Create, endpt)
+	}
+	for _, endpt := range changes.UpdateOld {
+		_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
+		if _, ok := output[zoneName]; !ok {
+			output[zoneName] = &plan.Changes{}
+		}
+		output[zoneName].UpdateOld = append(output[zoneName].UpdateOld, endpt)
+	}
+	for _, endpt := range changes.UpdateNew {
+		_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
+		if _, ok := output[zoneName]; !ok {
+			output[zoneName] = &plan.Changes{}
+		}
+		output[zoneName].UpdateNew = append(output[zoneName].UpdateNew, endpt)
+	}
+
+	return output
+}
+
+func (p *OVHProvider) handleSingleZoneUpdate(ctx context.Context, zoneName string, existingRecords []ovhRecord, changes *plan.Changes) error {
+	allChanges := []ovhChange{}
+	var computedChanges []ovhChange
+
+	computedChanges, existingRecords = newOvhChangeCreateDelete(ovhCreate, changes.Create, zoneName, existingRecords)
+	allChanges = append(allChanges, computedChanges...)
+	computedChanges, existingRecords = newOvhChangeCreateDelete(ovhDelete, changes.Delete, zoneName, existingRecords)
+	allChanges = append(allChanges, computedChanges...)
+
+	computedChanges = newOvhChangeUpdate(changes.UpdateOld, changes.UpdateNew, zoneName, existingRecords)
+	allChanges = append(allChanges, computedChanges...)
+
+	log.Infof("OVH: %q: %d changes will be done", zoneName, len(allChanges))
+
+	eg, ctxErrGroup := errgroup.WithContext(ctx)
+	for _, change := range allChanges {
+		change := change
+		eg.Go(func() error {
+			return p.change(ctxErrGroup, change)
+		})
+	}
+
+	err := eg.Wait()
+
+	// do not refresh zone if errors: some records might haven't been processed yet, hence the zone will be in an inconsistent state
+	// if modification of the zone was in error, invalidating the cache to make sure next run will start freshly
+	if err == nil {
+		err = p.refresh(ctx, zoneName)
+	} else {
+		p.invalidateCache(zoneName)
+	}
+
+	return err
+}
+
 // ApplyChanges applies a given set of changes in a given zone.
 func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) (err error) {
-	// zones, err := p.zones()
-	// if err != nil {
-	// 	return provider.NewSoftError(err)
-	// }
-
-	// zoneNameIDMapper := provider.ZoneIDName{}
-	// for _, zone := range zones {
-	// 	zoneNameIDMapper.Add(zone, zone)
-	// }
-
-	// filterRecords := map[string][]*endpoint.Endpoint{}
-	// for _, endpt := range changes.Delete {
-	// 	_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
-	// 	//recordName := strings.TrimSuffix(endpoint.DNSName, "."+zoneName)
-	// 	filterRecords[zoneName] = append(filterRecords[zoneName], endpt)
-	// }
-	// for _, endpt := range changes.UpdateOld {
-	// 	_, zoneName := zoneNameIDMapper.FindZone(endpt.DNSName)
-	// 	filterRecords[zoneName] = append(filterRecords[zoneName], endpt)
-	// }
-
-	// zones, records, err := p.zonesRecords(ctx)
-	// if err != nil {
-	// 	return provider.NewSoftError(err)
-	// }
-
 	zones, records := p.lastRunZones, p.lastRunRecords
 	defer func() {
 		p.lastRunRecords = []ovhRecord{}
 		p.lastRunZones = []string{}
 	}()
 
-	log.Debugf("OVH: changes %#v", *changes)
 	for _, change := range changes.Create {
 		log.Debugf("OVH: changes CREATE %#v", *change)
 	}
@@ -188,30 +243,15 @@ func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) (
 		log.Debugf("OVH: changes DELETE %#v", *change)
 	}
 
-	allChanges := make([]ovhChange, 0, countTargets(changes.Create, changes.UpdateNew, changes.UpdateOld, changes.Delete))
-	allChanges = append(allChanges, newOvhChange(ovhCreate, changes.Create, zones, records)...)
-	allChanges = append(allChanges, newOvhChange(ovhCreate, changes.UpdateNew, zones, records)...)
-	allChanges = append(allChanges, newOvhChange(ovhDelete, changes.UpdateOld, zones, records)...)
-	allChanges = append(allChanges, newOvhChange(ovhDelete, changes.Delete, zones, records)...)
+	changesByZoneName := planChangesByZoneName(zones, changes)
+	eg, ctx := errgroup.WithContext(ctx)
 
-	log.Infof("OVH: %d changes will be done", len(allChanges))
-
-	eg, _ := errgroup.WithContext(ctx)
-	for _, change := range allChanges {
-		change := change
+	for zoneName, changes := range changesByZoneName {
 		eg.Go(func() error {
-			err := p.change(change)
-
-			// do not refresh zone if errors: we might miss some records, hence the zone will be in an inconsistent mode
-			// if modification of the zone was in error, invalidating the cache to make sure next run will start freshly
-			if err == nil {
-				err = p.refresh(change.Zone)
-			} else {
-				p.invalidateCache(change.Zone)
-			}
-			return err
+			return p.handleSingleZoneUpdate(ctx, zoneName, records, changes)
 		})
 	}
+
 	if err := eg.Wait(); err != nil {
 		return provider.NewSoftError(err)
 	}
@@ -219,7 +259,7 @@ func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) (
 	return nil
 }
 
-func (p *OVHProvider) refresh(zone string) error {
+func (p *OVHProvider) refresh(ctx context.Context, zone string) error {
 	log.Debugf("OVH: Refresh %s zone", zone)
 
 	// Zone has been altered so we invalidate the cache
@@ -227,26 +267,33 @@ func (p *OVHProvider) refresh(zone string) error {
 	p.invalidateCache(zone)
 
 	p.apiRateLimiter.Take()
-	if err := p.client.Post(fmt.Sprintf("/domain/zone/%s/refresh", zone), nil, nil); err != nil {
+	if err := p.client.PostWithContext(ctx, fmt.Sprintf("/domain/zone/%s/refresh", url.PathEscape(zone)), nil, nil); err != nil {
 		return provider.NewSoftError(err)
 	}
 	return nil
 }
 
-func (p *OVHProvider) change(change ovhChange) error {
+func (p *OVHProvider) change(ctx context.Context, change ovhChange) error {
 	p.apiRateLimiter.Take()
 
 	switch change.Action {
 	case ovhCreate:
 		log.Debugf("OVH: Add an entry to %s", change.String())
-		return p.client.Post(fmt.Sprintf("/domain/zone/%s/record", change.Zone), change.ovhRecordFields, nil)
+		return p.client.PostWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record", url.PathEscape(change.Zone)), change.ovhRecordFields, nil)
 	case ovhDelete:
 		if change.ID == 0 {
 			return ErrRecordToMutateNotFound
 		}
 		log.Debugf("OVH: Delete an entry to %s", change.String())
-		return p.client.Delete(fmt.Sprintf("/domain/zone/%s/record/%d", change.Zone, change.ID), nil)
+		return p.client.DeleteWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record/%d", url.PathEscape(change.Zone), change.ID), nil)
+	case ovhUpdate:
+		if change.ID == 0 {
+			return ErrRecordToMutateNotFound
+		}
+		log.Debugf("OVH: Update an entry to %s", change.String())
+		return p.client.PutWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record/%d", url.PathEscape(change.Zone), change.ID), change.ovhRecordFieldUpdate, nil)
 	}
+
 	return nil
 }
 
@@ -256,7 +303,7 @@ func (p *OVHProvider) invalidateCache(zone string) {
 
 func (p *OVHProvider) zonesRecords(ctx context.Context) ([]string, []ovhRecord, error) {
 	var allRecords []ovhRecord
-	zones, err := p.zones()
+	zones, err := p.zones(ctx)
 	if err != nil {
 		return nil, nil, provider.NewSoftError(err)
 	}
@@ -265,7 +312,7 @@ func (p *OVHProvider) zonesRecords(ctx context.Context) ([]string, []ovhRecord, 
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, zone := range zones {
 		zone := zone
-		eg.Go(func() error { return p.records(&ctx, &zone, chRecords, nil) })
+		eg.Go(func() error { return p.records(ctx, &zone, chRecords, nil) })
 	}
 	if err := eg.Wait(); err != nil {
 		return nil, nil, provider.NewSoftError(err)
@@ -277,31 +324,12 @@ func (p *OVHProvider) zonesRecords(ctx context.Context) ([]string, []ovhRecord, 
 	return zones, allRecords, nil
 }
 
-func (p *OVHProvider) zonesRecordsWithFilter(ctx context.Context, filterRecords map[string][]*endpoint.Endpoint) ([]ovhRecord, error) {
-	var allRecords []ovhRecord
-
-	chRecords := make(chan []ovhRecord, len(filterRecords))
-	eg, ctx := errgroup.WithContext(ctx)
-	for zone, filters := range filterRecords {
-		zone := zone
-		eg.Go(func() error { return p.records(&ctx, &zone, chRecords, filters) })
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, provider.NewSoftError(err)
-	}
-	close(chRecords)
-	for records := range chRecords {
-		allRecords = append(allRecords, records...)
-	}
-	return allRecords, nil
-}
-
-func (p *OVHProvider) zones() ([]string, error) {
+func (p *OVHProvider) zones(ctx context.Context) ([]string, error) {
 	zones := []string{}
 	filteredZones := []string{}
 
 	p.apiRateLimiter.Take()
-	if err := p.client.Get("/domain/zone", &zones); err != nil {
+	if err := p.client.GetWithContext(ctx, "/domain/zone", &zones); err != nil {
 		return nil, err
 	}
 
@@ -320,45 +348,10 @@ type ovhSoa struct {
 	records []ovhRecord
 }
 
-// func (p *OVHProvider) recordsWithFilter(ctx *context.Context, zone *string, records chan<- []ovhRecord, filterRecords []*endpoint.Endpoint) error {
-// 	ovhRecords := make([]ovhRecord, 0, len(filterRecords))
-// 	eg, _ := errgroup.WithContext(*ctx)
-// 	chRecords := make(chan ovhRecord, len(filterRecords))
-
-// 	p.apiRateLimiter.Take()
-// 	for _, filterRecord := range filterRecords {
-// 		var recordsIds []uint64
-
-// 		if err := p.client.Get(fmt.Sprintf("/domain/zone/%s/record?filterType=XX&subDomain=YY", url.PathEscape(*zone)), &recordsIds); err != nil {
-// 			return err
-// 		}
-// 		for _, id := range recordsIds {
-// 			id := id
-// 			eg.Go(func() error { return p.record(zone, id, chRecords) })
-// 		}
-// 		if err := eg.Wait(); err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	close(chRecords)
-// 	for record := range chRecords {
-// 		ovhRecords = append(ovhRecords, record)
-// 	}
-
-// 	if p.UseCache {
-// 		soa.records = ovhRecords
-// 		_ = p.cacheInstance.Add(*zone+"#soa", soa, time.Hour)
-// 	}
-
-// 	records <- ovhRecords
-// 	return nil
-// }
-
-func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<- []ovhRecord, filterRecords []*endpoint.Endpoint) error {
+func (p *OVHProvider) records(ctx context.Context, zone *string, records chan<- []ovhRecord, filterRecords []*endpoint.Endpoint) error {
 	var recordsIds []uint64
 	ovhRecords := make([]ovhRecord, len(recordsIds))
-	eg, _ := errgroup.WithContext(*ctx)
+	eg, ctxErrGroup := errgroup.WithContext(ctx)
 
 	if p.UseCache {
 		if cachedSoaItf, ok := p.cacheInstance.Get(*zone + "#soa"); ok {
@@ -368,7 +361,7 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(*zone), dns.TypeSOA)
-			in, _, err := p.dnsClient.ExchangeContext(*ctx, m, strings.TrimSuffix(cachedSoa.Server, ".")+":53")
+			in, _, err := p.dnsClient.ExchangeContext(ctx, m, strings.TrimSuffix(cachedSoa.Server, ".")+":53")
 			if err == nil {
 				if s, ok := in.Answer[0].(*dns.SOA); ok {
 					if s.Serial == cachedSoa.Serial {
@@ -388,22 +381,18 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 	p.apiRateLimiter.Take()
 	var soa ovhSoa
 	if p.UseCache {
-		if err := p.client.Get("/domain/zone/"+*zone+"/soa", &soa); err != nil {
+		if err := p.client.GetWithContext(ctx, "/domain/zone/"+url.PathEscape(*zone)+"/soa", &soa); err != nil {
 			return err
 		}
 	}
 
-	// if len(filterRecords) > 0 {
-	// 	return p.recordsWithFilter(ctx, zone, records, filterRecords)
-	// }
-
-	if err := p.client.Get(fmt.Sprintf("/domain/zone/%s/record", *zone), &recordsIds); err != nil {
+	if err := p.client.GetWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record", url.PathEscape(*zone)), &recordsIds); err != nil {
 		return err
 	}
 	chRecords := make(chan ovhRecord, len(recordsIds))
 	for _, id := range recordsIds {
 		id := id
-		eg.Go(func() error { return p.record(zone, id, chRecords) })
+		eg.Go(func() error { return p.record(ctxErrGroup, zone, id, chRecords) })
 	}
 	if err := eg.Wait(); err != nil {
 		return err
@@ -422,13 +411,13 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 	return nil
 }
 
-func (p *OVHProvider) record(zone *string, id uint64, records chan<- ovhRecord) error {
+func (p *OVHProvider) record(ctx context.Context, zone *string, id uint64, records chan<- ovhRecord) error {
 	record := ovhRecord{}
 
 	log.Debugf("OVH: Getting record %d for %s", id, *zone)
 
 	p.apiRateLimiter.Take()
-	if err := p.client.Get(fmt.Sprintf("/domain/zone/%s/record/%d", *zone, id), &record); err != nil {
+	if err := p.client.GetWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record/%d", url.PathEscape(*zone), id), &record); err != nil {
 		return err
 	}
 	if provider.SupportedRecordType(record.FieldType) {
@@ -471,36 +460,23 @@ func ovhGroupByNameAndType(records []ovhRecord) []*endpoint.Endpoint {
 	return endpoints
 }
 
-func newOvhChange(action int, endpoints []*endpoint.Endpoint, zones []string, records []ovhRecord) []ovhChange {
-	// Copy the records because we need to mutate the list.
-	newRecords := make([]ovhRecord, len(records))
-	copy(newRecords, records)
-
-	zoneNameIDMapper := provider.ZoneIDName{}
-	ovhChanges := make([]ovhChange, 0, countTargets(endpoints))
-	for _, zone := range zones {
-		zoneNameIDMapper.Add(zone, zone)
-	}
+func newOvhChangeCreateDelete(action int, endpoints []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) ([]ovhChange, []ovhRecord) {
+	ovhChanges := []ovhChange{}
+	toDeleteIds := []int{}
 
 	for _, e := range endpoints {
-		zone, _ := zoneNameIDMapper.FindZone(e.DNSName)
-		if zone == "" {
-			log.Debugf("Skipping record %s because no hosted zone matching record DNS Name was detected", e.DNSName)
-			continue
-		}
 		for _, target := range e.Targets {
-			if e.RecordType == endpoint.RecordTypeCNAME {
-				target = target + "."
-			}
 			change := ovhChange{
 				Action: action,
 				ovhRecord: ovhRecord{
 					Zone: zone,
 					ovhRecordFields: ovhRecordFields{
 						FieldType: e.RecordType,
-						SubDomain: strings.TrimSuffix(e.DNSName, "."+zone),
-						TTL:       ovhDefaultTTL,
-						Target:    target,
+						ovhRecordFieldUpdate: ovhRecordFieldUpdate{
+							SubDomain: strings.TrimSuffix(e.DNSName, "."+zone),
+							TTL:       ovhDefaultTTL,
+							Target:    target,
+						},
 					},
 				},
 			}
@@ -510,30 +486,141 @@ func newOvhChange(action int, endpoints []*endpoint.Endpoint, zones []string, re
 
 			// The Zone might have multiple records with the same target. In order to avoid applying the action to the
 			// same OVH record, we remove a record from the list when a match is found.
-			for i := 0; i < len(newRecords); i++ {
-				rec := newRecords[i]
-				if rec.Zone == change.Zone && rec.SubDomain == change.SubDomain && rec.FieldType == change.FieldType && rec.Target == change.Target {
-					change.ID = rec.ID
-					// Deleting this record from the list to avoid retargetting it later if a change with a similar target exists.
-					newRecords = append(newRecords[:i], newRecords[i+1:]...)
-					break
+			if action == ovhDelete {
+				for i, rec := range existingRecords {
+					if rec.Zone == change.Zone && rec.SubDomain == change.SubDomain && rec.FieldType == change.FieldType && rec.Target == change.Target {
+						change.ID = rec.ID
+						toDeleteIds = append(toDeleteIds, i)
+						break
+					}
 				}
 			}
+
 			ovhChanges = append(ovhChanges, change)
 		}
 	}
 
-	return ovhChanges
-}
-
-func countTargets(allEndpoints ...[]*endpoint.Endpoint) int {
-	count := 0
-	for _, endpoints := range allEndpoints {
-		for _, endpoint := range endpoints {
-			count += len(endpoint.Targets)
+	if len(toDeleteIds) > 0 {
+		// Copy the records because we need to mutate the list.
+		existingRecords = slices.Clone(existingRecords)
+		for _, id := range toDeleteIds {
+			existingRecords = slices.Delete(existingRecords, id, id)
 		}
 	}
-	return count
+
+	return ovhChanges, existingRecords
+}
+
+func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) []ovhChange {
+	zoneNameIDMapper := provider.ZoneIDName{}
+	zoneNameIDMapper.Add(zone, zone)
+
+	oldEndpointByTypeAndName := map[string]*endpoint.Endpoint{}
+	newEndpointByTypeAndName := map[string]*endpoint.Endpoint{}
+	oldRecordsInZone := map[string][]ovhRecord{}
+
+	for _, e := range endpointsOld {
+		sub := strings.TrimSuffix(e.DNSName, "."+zone)
+		oldEndpointByTypeAndName[e.RecordType+"//"+sub] = e
+	}
+	for _, e := range endpointsNew {
+		sub := strings.TrimSuffix(e.DNSName, "."+zone)
+		newEndpointByTypeAndName[e.RecordType+"//"+sub] = e
+	}
+
+	for id, _ := range oldEndpointByTypeAndName {
+		for _, record := range existingRecords {
+			if id == record.FieldType+"//"+record.SubDomain {
+				oldRecordsInZone[id] = append(oldRecordsInZone[id], record)
+			}
+		}
+	}
+
+	changes := []ovhChange{}
+
+	for id, _ := range oldEndpointByTypeAndName {
+		oldRecords := slices.Clone(oldRecordsInZone[id])
+		endpointsNew := newEndpointByTypeAndName[id]
+
+		toInsertTarget := []string{}
+
+		for _, target := range endpointsNew.Targets {
+			var toDelete int = -1
+
+			for i, record := range oldRecords {
+				if target == record.Target {
+					toDelete = i
+					break
+				}
+			}
+
+			if toDelete >= 0 {
+				oldRecords = slices.Delete(oldRecords, toDelete, toDelete)
+			} else {
+				toInsertTarget = append(toInsertTarget, target)
+			}
+		}
+
+		toInsertTargetToDelete := []int{}
+		for i, target := range toInsertTarget {
+			if len(oldRecords) == 0 {
+				break
+			}
+
+			record := oldRecords[0]
+			oldRecords = slices.Delete(oldRecords, 0, 0)
+			record.Target = target
+
+			if endpointsNew.RecordTTL.IsConfigured() {
+				record.TTL = int64(endpointsNew.RecordTTL)
+			} else {
+				record.TTL = ovhDefaultTTL
+			}
+			changes = append(changes, ovhChange{
+				Action:    ovhUpdate,
+				ovhRecord: record,
+			})
+			toInsertTargetToDelete = append(toInsertTargetToDelete, i)
+		}
+		for _, i := range toInsertTargetToDelete {
+			toInsertTarget = slices.Delete(toInsertTarget, i, i)
+		}
+
+		if len(toInsertTarget) > 0 {
+			for _, target := range toInsertTarget {
+				recordTTL := int64(ovhDefaultTTL)
+				if endpointsNew.RecordTTL.IsConfigured() {
+					recordTTL = int64(endpointsNew.RecordTTL)
+				}
+
+				changes = append(changes, ovhChange{
+					Action: ovhCreate,
+					ovhRecord: ovhRecord{
+						Zone: zone,
+						ovhRecordFields: ovhRecordFields{
+							FieldType: endpointsNew.RecordType,
+							ovhRecordFieldUpdate: ovhRecordFieldUpdate{
+								SubDomain: strings.TrimSuffix(endpointsNew.DNSName, "."+zone),
+								TTL:       recordTTL,
+								Target:    target,
+							},
+						},
+					},
+				})
+			}
+		}
+
+		if len(oldRecords) > 0 {
+			for i := range oldRecords {
+				changes = append(changes, ovhChange{
+					Action:    ovhDelete,
+					ovhRecord: oldRecords[i],
+				})
+			}
+		}
+	}
+
+	return changes
 }
 
 func (c *ovhChange) String() string {
