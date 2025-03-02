@@ -312,7 +312,7 @@ func (p *OVHProvider) zonesRecords(ctx context.Context) ([]string, []ovhRecord, 
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, zone := range zones {
 		zone := zone
-		eg.Go(func() error { return p.records(ctx, &zone, chRecords, nil) })
+		eg.Go(func() error { return p.records(ctx, &zone, chRecords) })
 	}
 	if err := eg.Wait(); err != nil {
 		return nil, nil, provider.NewSoftError(err)
@@ -348,7 +348,7 @@ type ovhSoa struct {
 	records []ovhRecord
 }
 
-func (p *OVHProvider) records(ctx context.Context, zone *string, records chan<- []ovhRecord, filterRecords []*endpoint.Endpoint) error {
+func (p *OVHProvider) records(ctx context.Context, zone *string, records chan<- []ovhRecord) error {
 	var recordsIds []uint64
 	ovhRecords := make([]ovhRecord, len(recordsIds))
 	eg, ctxErrGroup := errgroup.WithContext(ctx)
@@ -528,7 +528,7 @@ func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpo
 		newEndpointByTypeAndName[e.RecordType+"//"+sub] = e
 	}
 
-	for id, _ := range oldEndpointByTypeAndName {
+	for id := range oldEndpointByTypeAndName {
 		for _, record := range existingRecords {
 			if id == record.FieldType+"//"+record.SubDomain {
 				oldRecordsInZone[id] = append(oldRecordsInZone[id], record)
@@ -538,7 +538,7 @@ func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpo
 
 	changes := []ovhChange{}
 
-	for id, _ := range oldEndpointByTypeAndName {
+	for id := range oldEndpointByTypeAndName {
 		oldRecords := slices.Clone(oldRecordsInZone[id])
 		endpointsNew := newEndpointByTypeAndName[id]
 
