@@ -63,7 +63,15 @@ type OVHProvider struct {
 	apiRateLimiter ratelimit.Limiter
 
 	domainFilter endpoint.DomainFilter
-	DryRun       bool
+
+	// DryRun enables dry-run mode
+	DryRun bool
+
+	// EnableCNAMERelativeTarget controls if CNAME target should be sent with relative format.
+	// Previous implementations of the OVHProvider always added a final dot as for absolut format.
+	// Default value is false, all CNAME are transformed into absolut format.
+	// Setting this to true will allow relative format to be sent to DNS zone.
+	EnableCNAMERelativeTarget bool
 
 	// UseCache controls if the OVHProvider will cache records in memory, and serve them
 	// without recontacting the OVHcloud API if the SOA of the domain zone hasn't changed.
@@ -117,7 +125,7 @@ type ovhChange struct {
 }
 
 // NewOVHProvider initializes a new OVH DNS based Provider.
-func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, endpoint string, apiRateLimit int, dryRun bool) (*OVHProvider, error) {
+func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, endpoint string, apiRateLimit int, enableCNAMERelative, dryRun bool) (*OVHProvider, error) {
 	client, err := ovh.NewEndpointClient(endpoint)
 	if err != nil {
 		return nil, err
@@ -130,13 +138,14 @@ func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, end
 		return nil, ErrNoDryRun
 	}
 	return &OVHProvider{
-		client:         client,
-		domainFilter:   domainFilter,
-		apiRateLimiter: ratelimit.New(apiRateLimit),
-		DryRun:         dryRun,
-		cacheInstance:  cache.New(cache.NoExpiration, cache.NoExpiration),
-		dnsClient:      new(dns.Client),
-		UseCache:       true,
+		client:                    client,
+		domainFilter:              domainFilter,
+		apiRateLimiter:            ratelimit.New(apiRateLimit),
+		DryRun:                    dryRun,
+		cacheInstance:             cache.New(cache.NoExpiration, cache.NoExpiration),
+		dnsClient:                 new(dns.Client),
+		UseCache:                  true,
+		EnableCNAMERelativeTarget: enableCNAMERelative,
 	}, nil
 }
 
@@ -192,23 +201,23 @@ func planChangesByZoneName(zones []string, changes *plan.Changes) map[string]*pl
 	return output
 }
 
-func computeSingleZoneChanges(_ context.Context, zoneName string, existingRecords []ovhRecord, changes *plan.Changes) []ovhChange {
+func (p OVHProvider) computeSingleZoneChanges(_ context.Context, zoneName string, existingRecords []ovhRecord, changes *plan.Changes) []ovhChange {
 	allChanges := []ovhChange{}
 	var computedChanges []ovhChange
 
-	computedChanges, existingRecords = newOvhChangeCreateDelete(ovhCreate, changes.Create, zoneName, existingRecords)
+	computedChanges, existingRecords = p.newOvhChangeCreateDelete(ovhCreate, changes.Create, zoneName, existingRecords)
 	allChanges = append(allChanges, computedChanges...)
-	computedChanges, existingRecords = newOvhChangeCreateDelete(ovhDelete, changes.Delete, zoneName, existingRecords)
+	computedChanges, existingRecords = p.newOvhChangeCreateDelete(ovhDelete, changes.Delete, zoneName, existingRecords)
 	allChanges = append(allChanges, computedChanges...)
 
-	computedChanges = newOvhChangeUpdate(changes.UpdateOld, changes.UpdateNew, zoneName, existingRecords)
+	computedChanges = p.newOvhChangeUpdate(changes.UpdateOld, changes.UpdateNew, zoneName, existingRecords)
 	allChanges = append(allChanges, computedChanges...)
 
 	return allChanges
 }
 
 func (p *OVHProvider) handleSingleZoneUpdate(ctx context.Context, zoneName string, existingRecords []ovhRecord, changes *plan.Changes) error {
-	allChanges := computeSingleZoneChanges(ctx, zoneName, existingRecords, changes)
+	allChanges := p.computeSingleZoneChanges(ctx, zoneName, existingRecords, changes)
 	log.Infof("OVH: %q: %d changes will be done", zoneName, len(allChanges))
 
 	eg, ctxErrGroup := errgroup.WithContext(ctx)
@@ -470,7 +479,7 @@ func ovhGroupByNameAndType(records []ovhRecord) []*endpoint.Endpoint {
 	return endpoints
 }
 
-func newOvhChangeCreateDelete(action int, endpoints []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) ([]ovhChange, []ovhRecord) {
+func (p OVHProvider) newOvhChangeCreateDelete(action int, endpoints []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) ([]ovhChange, []ovhRecord) {
 	ovhChanges := []ovhChange{}
 	toDeleteIds := []int{}
 
@@ -490,6 +499,7 @@ func newOvhChangeCreateDelete(action int, endpoints []*endpoint.Endpoint, zone s
 					},
 				},
 			}
+			p.formatCNAMETarget(&change)
 			if e.RecordTTL.IsConfigured() {
 				change.TTL = int64(e.RecordTTL)
 			}
@@ -531,7 +541,7 @@ func convertDNSNameIntoSubDomain(DNSName string, zoneName string) string {
 	return sub
 }
 
-func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) []ovhChange {
+func (p OVHProvider) newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) []ovhChange {
 	zoneNameIDMapper := provider.ZoneIDName{}
 	zoneNameIDMapper.Add(zone, zone)
 
@@ -596,10 +606,13 @@ func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpo
 			} else {
 				record.TTL = ovhDefaultTTL
 			}
-			changes = append(changes, ovhChange{
+
+			change := ovhChange{
 				Action:    ovhUpdate,
 				ovhRecord: record,
-			})
+			}
+			p.formatCNAMETarget(&change)
+			changes = append(changes, change)
 			toInsertTargetToDelete = append(toInsertTargetToDelete, i)
 		}
 		for _, i := range toInsertTargetToDelete {
@@ -613,7 +626,7 @@ func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpo
 					recordTTL = int64(endpointsNew.RecordTTL)
 				}
 
-				changes = append(changes, ovhChange{
+				change := ovhChange{
 					Action: ovhCreate,
 					ovhRecord: ovhRecord{
 						Zone: zone,
@@ -626,7 +639,9 @@ func newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpo
 							},
 						},
 					},
-				})
+				}
+				p.formatCNAMETarget(&change)
+				changes = append(changes, change)
 			}
 		}
 
@@ -658,4 +673,20 @@ func (c *ovhChange) String() string {
 		return fmt.Sprintf("%s zone (ID : %d) action(%s) : %s %d IN %s %s", c.Zone, c.ID, action, c.SubDomain, c.TTL, c.FieldType, c.Target)
 	}
 	return fmt.Sprintf("%s zone action(%s) : %s %d IN %s %s", c.Zone, action, c.SubDomain, c.TTL, c.FieldType, c.Target)
+}
+
+func (p OVHProvider) formatCNAMETarget(change *ovhChange) {
+	if change.FieldType != endpoint.RecordTypeCNAME {
+		return
+	}
+
+	if p.EnableCNAMERelativeTarget {
+		return
+	}
+
+	if strings.HasSuffix(change.Target, ".") {
+		return
+	}
+
+	change.Target += "."
 }

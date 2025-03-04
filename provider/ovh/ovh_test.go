@@ -327,7 +327,8 @@ func TestOvhComputeChanges(t *testing.T) {
 		},
 	}
 
-	ovhChanges := computeSingleZoneChanges(t.Context(), "example.net", existingRecords, &changes)
+	provider := &OVHProvider{client: nil, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration)}
+	ovhChanges := provider.computeSingleZoneChanges(t.Context(), "example.net", existingRecords, &changes)
 	td.Cmp(t, ovhChanges, []ovhChange{
 		{
 			Action: ovhCreate,
@@ -357,6 +358,8 @@ func TestOvhRefresh(t *testing.T) {
 }
 
 func TestOvhNewChange(t *testing.T) {
+	provider := &OVHProvider{client: nil, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration)}
+
 	endpoints := []*endpoint.Endpoint{
 		{DNSName: ".example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
 		{DNSName: "ovh.example.net", RecordType: "A", Targets: []string{"203.0.113.43"}},
@@ -365,11 +368,11 @@ func TestOvhNewChange(t *testing.T) {
 	}
 
 	// Create change
-	changes, _ := newOvhChangeCreateDelete(ovhCreate, endpoints, "example.net", []ovhRecord{})
+	changes, _ := provider.newOvhChangeCreateDelete(ovhCreate, endpoints, "example.net", []ovhRecord{})
 	td.Cmp(t, changes, []ovhChange{
 		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}},
 		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.43"}}}},
-		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "CNAME", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh2", TTL: ovhDefaultTTL, Target: "ovh.example.net"}}}},
+		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "CNAME", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh2", TTL: ovhDefaultTTL, Target: "ovh.example.net."}}}},
 	})
 
 	// Delete change
@@ -381,11 +384,27 @@ func TestOvhNewChange(t *testing.T) {
 		{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", Target: "203.0.113.42"}}},
 		{ID: 44, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", Target: "203.0.113.42"}}},
 	}
-	changes, _ = newOvhChangeCreateDelete(ovhDelete, endpoints, "example.net", records)
+	changes, _ = provider.newOvhChangeCreateDelete(ovhDelete, endpoints, "example.net", records)
 	td.Cmp(t, changes, []ovhChange{
 		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
 		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
 		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 44, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
+	})
+
+	// Create change with CNAME relative
+	endpoints = []*endpoint.Endpoint{
+		{DNSName: ".example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
+		{DNSName: "ovh.example.net", RecordType: "A", Targets: []string{"203.0.113.43"}},
+		{DNSName: "ovh2.example.net", RecordType: "CNAME", Targets: []string{"ovh"}},
+		{DNSName: "test.example.org"},
+	}
+
+	provider = &OVHProvider{client: nil, EnableCNAMERelativeTarget: true, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration)}
+	changes, _ = provider.newOvhChangeCreateDelete(ovhCreate, endpoints, "example.net", []ovhRecord{})
+	td.Cmp(t, changes, []ovhChange{
+		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}},
+		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.43"}}}},
+		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "CNAME", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh2", TTL: ovhDefaultTTL, Target: "ovh"}}}},
 	})
 }
 
