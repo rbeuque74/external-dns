@@ -50,8 +50,6 @@ const (
 var (
 	// ErrRecordToMutateNotFound when ApplyChange has to update/delete and didn't found the record in the existing zone (Change with no record ID)
 	ErrRecordToMutateNotFound = errors.New("record to mutate not found in current zone")
-	// ErrNoDryRun No dry run support for the moment
-	ErrNoDryRun = errors.New("dry run not supported")
 )
 
 // OVHProvider is an implementation of Provider for OVH DNS.
@@ -133,10 +131,6 @@ func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, end
 
 	client.UserAgent = "ExternalDNS/" + externaldns.Version
 
-	// TODO: Add Dry Run support
-	if dryRun {
-		return nil, ErrNoDryRun
-	}
 	return &OVHProvider{
 		client:                    client,
 		domainFilter:              domainFilter,
@@ -286,9 +280,14 @@ func (p *OVHProvider) refresh(ctx context.Context, zone string) error {
 	p.invalidateCache(zone)
 
 	p.apiRateLimiter.Take()
+	if p.DryRun {
+		log.Infof("OVH: Dry-run: Would have refresh DNS zone %q", zone)
+		return nil
+	}
 	if err := p.client.PostWithContext(ctx, fmt.Sprintf("/domain/zone/%s/refresh", url.PathEscape(zone)), nil, nil); err != nil {
 		return provider.NewSoftError(err)
 	}
+
 	return nil
 }
 
@@ -298,18 +297,30 @@ func (p *OVHProvider) change(ctx context.Context, change ovhChange) error {
 	switch change.Action {
 	case ovhCreate:
 		log.Debugf("OVH: Add an entry to %s", change.String())
+		if p.DryRun {
+			log.Infof("OVH: Dry-run: Would have created a DNS record for zone %q", change.Zone)
+			return nil
+		}
 		return p.client.PostWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record", url.PathEscape(change.Zone)), change.ovhRecordFields, nil)
 	case ovhDelete:
 		if change.ID == 0 {
 			return ErrRecordToMutateNotFound
 		}
 		log.Debugf("OVH: Delete an entry to %s", change.String())
+		if p.DryRun {
+			log.Infof("OVH: Dry-run: Would have deleted a DNS record for zone %q", change.Zone)
+			return nil
+		}
 		return p.client.DeleteWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record/%d", url.PathEscape(change.Zone), change.ID), nil)
 	case ovhUpdate:
 		if change.ID == 0 {
 			return ErrRecordToMutateNotFound
 		}
 		log.Debugf("OVH: Update an entry to %s", change.String())
+		if p.DryRun {
+			log.Infof("OVH: Dry-run: Would have updated a DNS record for zone %q", change.Zone)
+			return nil
+		}
 		return p.client.PutWithContext(ctx, fmt.Sprintf("/domain/zone/%s/record/%d", url.PathEscape(change.Zone), change.ID), change.ovhRecordFieldUpdate, nil)
 	}
 
