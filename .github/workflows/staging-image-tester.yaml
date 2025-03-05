@@ -6,6 +6,10 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 permissions:
   contents: read  #  to fetch code (actions/checkout)
 
@@ -14,6 +18,9 @@ jobs:
   build:
     permissions:
       contents: read  #  to fetch code (actions/checkout)
+      packages: write
+      attestations: write
+      id-token: write
       checks: write  #  to create a new check based on the results (shogo82148/actions-goveralls)
 
     name: Build
@@ -33,5 +40,13 @@ jobs:
       run: |
         go get -v -t -d ./...
 
+    - name: Log in to the Container registry
+      uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Test
-      run: make build.image/multiarch
+      run: make build.push-amd64
+
