@@ -384,27 +384,11 @@ func TestOvhNewChange(t *testing.T) {
 		{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", Target: "203.0.113.42"}}},
 		{ID: 44, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", Target: "203.0.113.42"}}},
 	}
-	changes, _ = provider.newOvhChangeCreateDelete(ovhDelete, endpoints, "example.net", records)
-	td.Cmp(t, changes, []ovhChange{
-		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
-		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
-		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 44, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}}},
-	})
-
-	// Create change with CNAME relative
-	endpoints = []*endpoint.Endpoint{
-		{DNSName: ".example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
-		{DNSName: "ovh.example.net", RecordType: "A", Targets: []string{"203.0.113.43"}},
-		{DNSName: "ovh2.example.net", RecordType: "CNAME", Targets: []string{"ovh"}},
-		{DNSName: "test.example.org"},
-	}
-
-	provider = &OVHProvider{client: nil, EnableCNAMERelativeTarget: true, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration)}
-	changes, _ = provider.newOvhChangeCreateDelete(ovhCreate, endpoints, "example.net", []ovhRecord{})
-	td.Cmp(t, changes, []ovhChange{
-		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}},
-		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: ovhDefaultTTL, Target: "203.0.113.43"}}}},
-		{Action: ovhCreate, ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "CNAME", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh2", TTL: ovhDefaultTTL, Target: "ovh"}}}},
+	changes = newOvhChange(ovhDelete, endpoints, []string{"example.net"}, records)
+	assert.ElementsMatch(changes, []ovhChange{
+		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{SubDomain: "ovh", FieldType: "A", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}},
+		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{SubDomain: "ovh", FieldType: "A", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}},
+		{Action: ovhDelete, ovhRecord: ovhRecord{ID: 44, Zone: "example.net", ovhRecordFields: ovhRecordFields{SubDomain: "ovh", FieldType: "A", TTL: ovhDefaultTTL, Target: "203.0.113.42"}}},
 	})
 }
 
@@ -465,6 +449,95 @@ func TestOvhApplyChanges(t *testing.T) {
 		},
 	}))
 	client.AssertExpectations(t)
+
+	// Test Dry-Run
+	client = new(mockOvhClient)
+	provider = &OVHProvider{client: client, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration), DryRun: true}
+	changes = plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
+		},
+		Delete: []*endpoint.Endpoint{
+			{DNSName: "ovh.example.net", RecordType: "A", Targets: []string{"203.0.113.43"}},
+		},
+	}
+
+	client.On("GetWithContext", "/domain/zone").Return([]string{"example.net"}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record").Return([]uint64{42}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record/42").Return(ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh", TTL: 10, Target: "203.0.113.43"}}}, nil).Once()
+
+	_, err = provider.Records(t.Context())
+	td.CmpNoError(t, err)
+	td.CmpNoError(t, provider.ApplyChanges(t.Context(), &changes))
+	client.AssertExpectations(t)
+
+	// Test Update
+	client = new(mockOvhClient)
+	provider = &OVHProvider{client: client, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration), DryRun: false}
+	changes = plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
+		},
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.43"}},
+		},
+	}
+
+	client.On("GetWithContext", "/domain/zone").Return([]string{"example.net"}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record").Return([]uint64{42}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record/42").Return(ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}, nil).Once()
+	client.On("PutWithContext", "/domain/zone/example.net/record/42", ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.43"}).Return(nil, nil).Once()
+	client.On("PostWithContext", "/domain/zone/example.net/refresh", nil).Return(nil, nil).Once()
+
+	_, err = provider.Records(t.Context())
+	td.CmpNoError(t, err)
+	td.CmpNoError(t, provider.ApplyChanges(t.Context(), &changes))
+	client.AssertExpectations(t)
+
+	// Test Update DryRun
+	client = new(mockOvhClient)
+	provider = &OVHProvider{client: client, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration), DryRun: true}
+	changes = plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42"}},
+		},
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.43"}},
+		},
+	}
+
+	client.On("GetWithContext", "/domain/zone").Return([]string{"example.net"}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record").Return([]uint64{42}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record/42").Return(ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}, nil).Once()
+
+	_, err = provider.Records(t.Context())
+	td.CmpNoError(t, err)
+	td.CmpNoError(t, provider.ApplyChanges(t.Context(), &changes))
+	client.AssertExpectations(t)
+
+	// Test Update 2 records => 1 record
+	client = new(mockOvhClient)
+	provider = &OVHProvider{client: client, apiRateLimiter: ratelimit.New(10), cacheInstance: cache.New(cache.NoExpiration, cache.NoExpiration), DryRun: false}
+	changes = plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.42", "203.0.113.43"}},
+		},
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "example.net", RecordType: "A", RecordTTL: 10, Targets: []string{"203.0.113.43"}},
+		},
+	}
+
+	client.On("GetWithContext", "/domain/zone").Return([]string{"example.net"}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record").Return([]uint64{42, 43}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record/42").Return(ovhRecord{ID: 42, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.42"}}}, nil).Once()
+	client.On("GetWithContext", "/domain/zone/example.net/record/43").Return(ovhRecord{ID: 43, Zone: "example.net", ovhRecordFields: ovhRecordFields{FieldType: "A", ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "", TTL: 10, Target: "203.0.113.43"}}}, nil).Once()
+	client.On("DeleteWithContext", "/domain/zone/example.net/record/42").Return(nil, nil).Once()
+	client.On("PostWithContext", "/domain/zone/example.net/refresh", nil).Return(nil, nil).Once()
+
+	_, err = provider.Records(t.Context())
+	td.CmpNoError(t, err)
+	td.CmpNoError(t, provider.ApplyChanges(t.Context(), &changes))
+	client.AssertExpectations(t)
 }
 
 func TestOvhChange(t *testing.T) {
@@ -494,4 +567,22 @@ func TestOvhChange(t *testing.T) {
 		ovhRecord: ovhRecord{Zone: "example.net", ovhRecordFields: ovhRecordFields{ovhRecordFieldUpdate: ovhRecordFieldUpdate{SubDomain: "ovh"}}},
 	}))
 	client.AssertExpectations(t)
+}
+
+func TestOvhCountTargets(t *testing.T) {
+	cases := []struct {
+		endpoints [][]*endpoint.Endpoint
+		count     int
+	}{
+		{[][]*endpoint.Endpoint{{{DNSName: "ovh.example.net", Targets: endpoint.Targets{"target"}}}}, 1},
+		{[][]*endpoint.Endpoint{{{DNSName: "ovh.example.net", Targets: endpoint.Targets{"target"}}, {DNSName: "ovh.example.net", Targets: endpoint.Targets{"target"}}}}, 2},
+		{[][]*endpoint.Endpoint{{{DNSName: "ovh.example.net", Targets: endpoint.Targets{"target", "target", "target"}}}}, 3},
+		{[][]*endpoint.Endpoint{{{DNSName: "ovh.example.net", Targets: endpoint.Targets{"target", "target"}}}, {{DNSName: "ovh.example.net", Targets: endpoint.Targets{"target", "target"}}}}, 4},
+	}
+	for _, test := range cases {
+		count := countTargets(test.endpoints...)
+		if count != test.count {
+			t.Errorf("Wrong targets counts (Should be %d, get %d)", test.count, count)
+		}
+	}
 }

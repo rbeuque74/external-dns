@@ -16,7 +16,9 @@ instructions for creating a zone.
 
 ## Creating OVHcloud Credentials
 
-You first need to create an OVHcloud application: follow the [OVHcloud documentation](https://help.ovhcloud.com/csm/en-gb-api-getting-started-ovhcloud-api?id=kb_article_view&sysparm_article=KB0042784#advanced-usage-pair-ovhcloud-apis-with-an-application) you will have your `Application key` and `Application secret`
+You first need to create an OVHcloud application: follow the
+[OVHcloud documentation](https://help.ovhcloud.com/csm/en-gb-api-getting-started-ovhcloud-api?id=kb_article_view&sysparm_article=KB0042784#advanced-usage-pair-ovhcloud-apis-with-an-application)
+ you will have your `Application key` and `Application secret`
 
 And you will need to generate your consumer key, here the permissions needed :
 

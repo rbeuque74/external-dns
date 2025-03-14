@@ -243,17 +243,19 @@ func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) (
 		p.lastRunZones = []string{}
 	}()
 
-	for _, change := range changes.Create {
-		log.Debugf("OVH: changes CREATE dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
-	}
-	for _, change := range changes.UpdateOld {
-		log.Debugf("OVH: changes UPDATEOLD dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
-	}
-	for _, change := range changes.UpdateNew {
-		log.Debugf("OVH: changes UPDATENEW dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
-	}
-	for _, change := range changes.Delete {
-		log.Debugf("OVH: changes DELETE dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
+	if log.IsLevelEnabled(log.DebugLevel) {
+		for _, change := range changes.Create {
+			log.Debugf("OVH: changes CREATE dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
+		}
+		for _, change := range changes.UpdateOld {
+			log.Debugf("OVH: changes UPDATEOLD dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
+		}
+		for _, change := range changes.UpdateNew {
+			log.Debugf("OVH: changes UPDATENEW dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
+		}
+		for _, change := range changes.Delete {
+			log.Debugf("OVH: changes DELETE dns:%q / targets:%v / type:%q", change.DNSName, change.Targets, change.RecordType)
+		}
 	}
 
 	changesByZoneName := planChangesByZoneName(zones, changes)
@@ -434,7 +436,7 @@ func (p *OVHProvider) records(ctx context.Context, zone *string, records chan<- 
 
 	if p.UseCache {
 		soa.records = ovhRecords
-		_ = p.cacheInstance.Add(*zone+"#soa", soa, time.Hour)
+		_ = p.cacheInstance.Add(*zone+"#soa", soa, cache.DefaultExpiration)
 	}
 
 	records <- ovhRecords
@@ -545,11 +547,11 @@ func (p OVHProvider) newOvhChangeCreateDelete(action int, endpoints []*endpoint.
 }
 
 func convertDNSNameIntoSubDomain(DNSName string, zoneName string) string {
-	sub := strings.TrimSuffix(DNSName, "."+zoneName)
 	if DNSName == zoneName {
-		sub = ""
+		return ""
 	}
-	return sub
+
+	return strings.TrimSuffix(DNSName, "."+zoneName)
 }
 
 func (p OVHProvider) newOvhChangeUpdate(endpointsOld []*endpoint.Endpoint, endpointsNew []*endpoint.Endpoint, zone string, existingRecords []ovhRecord) []ovhChange {

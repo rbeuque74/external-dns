@@ -28,6 +28,7 @@
 | `--[no-]ignore-hostname-annotation` | Ignore hostname annotation when generating DNS names, valid only when --fqdn-template is set (default: false) |
 | `--[no-]ignore-non-host-network-pods` | Ignore pods not running on host network when using pod source (default: true) |
 | `--[no-]ignore-ingress-tls-spec` | Ignore the spec.tls section in Ingress resources (default: false) |
+| `--gateway-name=GATEWAY-NAME` | Limit Gateways of Route endpoints to a specific name (default: all names) |
 | `--gateway-namespace=GATEWAY-NAMESPACE` | Limit Gateways of Route endpoints to a specific namespace (default: all namespaces) |
 | `--gateway-label-filter=GATEWAY-LABEL-FILTER` | Filter Gateways of Route endpoints via label selector (default: all gateways) |
 | `--compatibility=` | Process annotation semantics from legacy implementations (optional, options: mate, molecule, kops-dns-controller) |
@@ -86,6 +87,9 @@
 | `--tencent-cloud-config-file="/etc/kubernetes/tencent-cloud.json"` | When using the Tencent Cloud provider, specify the Tencent Cloud configuration file (required when --provider=tencentcloud) |
 | `--tencent-cloud-zone-type=` | When using the Tencent Cloud provider, filter for zones with visibility (optional, options: public, private) |
 | `--[no-]cloudflare-proxied` | When using the Cloudflare provider, specify if the proxy mode must be enabled (default: disabled) |
+| `--[no-]cloudflare-custom-hostnames` | When using the Cloudflare provider, specify if the Custom Hostnames feature will be used. Requires "Cloudflare for SaaS" enabled. (default: disabled) |
+| `--cloudflare-custom-hostnames-min-tls-version=1.0` | When using the Cloudflare provider with the Custom Hostnames, specify which Minimum TLS Version will be used by default. (default: 1.0, options: 1.0, 1.1, 1.2, 1.3) |
+| `--cloudflare-custom-hostnames-certificate-authority=google` | When using the Cloudflare provider with the Custom Hostnames, specify which Cerrtificate Authority will be used by default. (default: google, options: google, ssl_com, lets_encrypt) |
 | `--cloudflare-dns-records-per-page=100` | When using the Cloudflare provider, specify how many DNS records listed per page, max possible 5,000 (default: 100) |
 | `--cloudflare-region-key=CLOUDFLARE-REGION-KEY` | When using the Cloudflare provider, specify the region (default: earth) |
 | `--coredns-prefix="/skydns/"` | When using the CoreDNS provider, specify the prefix name |
@@ -103,6 +107,7 @@
 | `--inmemory-zone=` | Provide a list of pre-configured zones for the inmemory provider; specify multiple times for multiple zones (optional) |
 | `--ovh-endpoint="ovh-eu"` | When using the OVH provider, specify the endpoint (default: ovh-eu) |
 | `--ovh-api-rate-limit=20` | When using the OVH provider, specify the API request rate limit, X operations by seconds (default: 20) |
+| `--[no-]ovh-enable-cname-relative` | When using the OVH provider, specify if CNAME should be treated as relative if target omit the final dot (default: false) |
 | `--pdns-server="http://localhost:8081"` | When using the PowerDNS/PDNS provider, specify the URL to the pdns server (required when --provider=pdns) |
 | `--pdns-server-id="localhost"` | When using the PowerDNS/PDNS provider, specify the id of the server to retrieve. Should be `localhost` except when the server is behind a proxy (optional when --provider=pdns) (default: localhost) |
 | `--pdns-api-key=""` | When using the PowerDNS/PDNS provider, specify the API key to use to authorize requests (required when --provider=pdns) |
